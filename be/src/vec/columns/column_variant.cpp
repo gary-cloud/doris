@@ -1051,47 +1051,94 @@ bool ColumnVariant::try_add_new_subcolumn(const PathInData& path) {
 }
 
 void ColumnVariant::insert_range_from(const IColumn& src, size_t start, size_t length) {
-    const auto& src_object = assert_cast<const ColumnVariant&>(src);
-    ENABLE_CHECK_CONSISTENCY(&src_object);
-    ENABLE_CHECK_CONSISTENCY(this);
+    const ColumnVariant* src_variant = nullptr;
+    const ColumnNullable* src_nullable = nullptr;
+    if (is_column_nullable(src)) {
+        src_nullable = assert_cast<const ColumnNullable*>(&src);
+        src_variant = assert_cast<const ColumnVariant*>(&src_nullable->get_nested_column());
+    } else {
+        src_variant = assert_cast<const ColumnVariant*>(&src);
+    }
+    DCHECK(src_variant != nullptr);
 
-    // First, insert src subcolumns
-    // We can reach the limit of subcolumns, and in this case
-    // the rest of subcolumns from src will be inserted into sparse column.
-    std::map<std::string_view, Subcolumn> src_path_and_subcoumn_for_sparse_column;
-    int idx_hint = 0;
-    for (const auto& entry : src_object.subcolumns) {
-        // Check if we already have such dense column path.
-        if (auto* subcolumn = get_subcolumn(entry->path, idx_hint); subcolumn != nullptr) {
-            subcolumn->insert_range_from(entry->data, start, length);
-        } else if (try_add_new_subcolumn(entry->path)) {
-            subcolumn = get_subcolumn(entry->path);
-            DCHECK(subcolumn != nullptr);
-            subcolumn->insert_range_from(entry->data, start, length);
-        } else {
-            CHECK(!entry->path.get_is_typed());
-            CHECK(!entry->path.has_nested_part());
-            src_path_and_subcoumn_for_sparse_column.emplace(entry->path.get_path(), entry->data);
+    auto insert_range_impl = [&](const ColumnVariant& src_object, size_t range_start,
+                                 size_t range_length) {
+        ENABLE_CHECK_CONSISTENCY(&src_object);
+        ENABLE_CHECK_CONSISTENCY(this);
+
+        // First, insert src subcolumns
+        // We can reach the limit of subcolumns, and in this case
+        // the rest of subcolumns from src will be inserted into sparse column.
+        std::map<std::string_view, Subcolumn> src_path_and_subcoumn_for_sparse_column;
+        int idx_hint = 0;
+        for (const auto& entry : src_object.subcolumns) {
+            // Check if we already have such dense column path.
+            if (auto* subcolumn = get_subcolumn(entry->path, idx_hint); subcolumn != nullptr) {
+                subcolumn->insert_range_from(entry->data, range_start, range_length);
+            } else if (try_add_new_subcolumn(entry->path)) {
+                subcolumn = get_subcolumn(entry->path);
+                DCHECK(subcolumn != nullptr);
+                subcolumn->insert_range_from(entry->data, range_start, range_length);
+            } else {
+                CHECK(!entry->path.get_is_typed());
+                CHECK(!entry->path.has_nested_part());
+                src_path_and_subcoumn_for_sparse_column.emplace(entry->path.get_path(),
+                                                                entry->data);
+            }
+            ++idx_hint;
         }
-        ++idx_hint;
+
+        // Paths in sparse column are sorted, so paths from src_dense_column_path_for_sparse_column should be inserted properly
+        // to keep paths sorted. Let's sort them in advance.
+        std::vector<std::pair<std::string_view, Subcolumn>> sorted_src_subcolumn_for_sparse_column;
+        auto it = src_path_and_subcoumn_for_sparse_column.begin();
+        auto end = src_path_and_subcoumn_for_sparse_column.end();
+        while (it != end) {
+            sorted_src_subcolumn_for_sparse_column.emplace_back(it->first, it->second);
+            ++it;
+        }
+
+        insert_from_sparse_column_and_fill_remaing_dense_column(
+                src_object, std::move(sorted_src_subcolumn_for_sparse_column), range_start,
+                range_length);
+
+        serialized_doc_value_column->insert_range_from(*src_object.serialized_doc_value_column,
+                                                       range_start, range_length);
+        num_rows += range_length;
+    };
+
+    if (!src_nullable) {
+        insert_range_impl(*src_variant, start, length);
+        ENABLE_CHECK_CONSISTENCY(this);
+        return;
     }
 
-    // Paths in sparse column are sorted, so paths from src_dense_column_path_for_sparse_column should be inserted properly
-    // to keep paths sorted. Let's sort them in advance.
-    std::vector<std::pair<std::string_view, Subcolumn>> sorted_src_subcolumn_for_sparse_column;
-    auto it = src_path_and_subcoumn_for_sparse_column.begin();
-    auto end = src_path_and_subcoumn_for_sparse_column.end();
-    while (it != end) {
-        sorted_src_subcolumn_for_sparse_column.emplace_back(it->first, it->second);
-        ++it;
+    if (!src_nullable->has_null(start, start + length)) {
+        insert_range_impl(*src_variant, start, length);
+        ENABLE_CHECK_CONSISTENCY(this);
+        return;
     }
 
-    insert_from_sparse_column_and_fill_remaing_dense_column(
-            src_object, std::move(sorted_src_subcolumn_for_sparse_column), start, length);
-
-    serialized_doc_value_column->insert_range_from(*src_object.serialized_doc_value_column, start,
-                                                   length);
-    num_rows += length;
+    const auto& null_map = src_nullable->get_null_map_data();
+    size_t pos = start;
+    size_t end = start + length;
+    while (pos < end) {
+        if (null_map[pos]) {
+            size_t next = pos + 1;
+            while (next < end && null_map[next]) {
+                ++next;
+            }
+            insert_many_defaults(next - pos);
+            pos = next;
+        } else {
+            size_t next = pos + 1;
+            while (next < end && !null_map[next]) {
+                ++next;
+            }
+            insert_range_impl(*src_variant, pos, next - pos);
+            pos = next;
+        }
+    }
     // finalize();
     ENABLE_CHECK_CONSISTENCY(this);
 }

@@ -19,6 +19,7 @@
 
 #include "cast_base.h"
 #include "cast_to_string.h"
+#include "vec/columns/column_nullable.h"
 #include "vec/data_types/data_type_variant.h"
 
 namespace doris::vectorized::CastWrapper {
@@ -140,13 +141,37 @@ struct CastVariantAdjust {
                           size_t /*input_rows_count*/, int32_t target_max,
                           bool enable_typed_paths_to_sparse,
                           const NullMap::value_type* /*null_map*/ = nullptr) {
-        const auto& col_from = block.get_by_position(arguments[0]).column;
-        const auto& from_variant = assert_cast<const ColumnVariant&>(*col_from);
-        MutableColumnPtr cloned = from_variant.clone();
-        auto* adjusted_variant = assert_cast<ColumnVariant*>(cloned.get());
+        auto& col_from = block.get_by_position(arguments[0]).column;
+        auto mutable_col = col_from->assume_mutable();
+        const bool result_nullable = block.get_by_position(result).type->is_nullable();
+        if (auto* nullable = check_and_get_column<ColumnNullable>(mutable_col.get());
+            nullable != nullptr) {
+            auto nested_mutable = nullable->get_nested_column_ptr();
+            auto* adjusted_variant = check_and_get_column<ColumnVariant>(nested_mutable.get());
+            if (adjusted_variant == nullptr) {
+                return Status::InternalError("Expected ColumnVariant in nullable variant cast");
+            }
+            adjusted_variant->set_variant_enable_typed_paths_to_sparse(
+                    enable_typed_paths_to_sparse);
+            RETURN_IF_ERROR(adjusted_variant->adjust_max_subcolumns_count(target_max));
+            if (result_nullable) {
+                block.replace_by_position(result, std::move(mutable_col));
+            } else {
+                block.replace_by_position(result, std::move(nested_mutable));
+            }
+            return Status::OK();
+        }
+        auto* adjusted_variant = check_and_get_column<ColumnVariant>(mutable_col.get());
+        if (adjusted_variant == nullptr) {
+            return Status::InternalError("Expected ColumnVariant in variant cast");
+        }
         adjusted_variant->set_variant_enable_typed_paths_to_sparse(enable_typed_paths_to_sparse);
         RETURN_IF_ERROR(adjusted_variant->adjust_max_subcolumns_count(target_max));
-        block.replace_by_position(result, std::move(cloned));
+        if (result_nullable) {
+            block.replace_by_position(result, make_nullable(std::move(mutable_col), false));
+        } else {
+            block.replace_by_position(result, std::move(mutable_col));
+        }
         return Status::OK();
     }
 };

@@ -65,6 +65,45 @@ static void construct_column(ColumnPB* column_pb, int32_t col_unique_id,
     }
 }
 
+static Status write_variant_segment(const TabletSchemaSPtr& tablet_schema,
+                                    const TabletSharedPtr& tablet, int seg_id,
+                                    vectorized::Block& block, SegmentFooterPB* footer) {
+    io::FileWriterPtr file_writer;
+    auto file_path = local_segment_path(tablet->tablet_path(), "0", seg_id);
+    RETURN_IF_ERROR(io::global_local_filesystem()->create_file(file_path, &file_writer));
+
+    ColumnWriterOptions opts;
+    opts.meta = footer->add_columns();
+    opts.compression_type = CompressionTypePB::LZ4;
+    opts.file_writer = file_writer.get();
+    opts.footer = footer;
+    RowsetWriterContext rowset_ctx;
+    rowset_ctx.write_type = DataWriteType::TYPE_DIRECT;
+    opts.rowset_ctx = &rowset_ctx;
+    opts.rowset_ctx->tablet_schema = tablet_schema;
+    TabletColumn column = tablet_schema->column(0);
+    _init_column_meta(opts.meta, 0, column, CompressionTypePB::LZ4);
+
+    std::unique_ptr<ColumnWriter> writer;
+    RETURN_IF_ERROR(ColumnWriter::create(opts, &column, file_writer.get(), &writer));
+    RETURN_IF_ERROR(writer->init());
+
+    auto olap_data_convertor = std::make_unique<vectorized::OlapBlockDataConvertor>();
+    olap_data_convertor->add_column_data_convertor(column);
+    size_t num_rows = block.get_by_position(0).column->size();
+    olap_data_convertor->set_source_content(&block, 0, num_rows);
+    auto [result, accessor] = olap_data_convertor->convert_column_data(0);
+    RETURN_IF_ERROR(result);
+    RETURN_IF_ERROR(writer->append(accessor->get_nullmap(), accessor->get_data(), num_rows));
+    RETURN_IF_ERROR(writer->finish());
+    RETURN_IF_ERROR(writer->write_data());
+    RETURN_IF_ERROR(writer->write_ordinal_index());
+    RETURN_IF_ERROR(writer->write_zone_map());
+    RETURN_IF_ERROR(file_writer->close());
+    footer->set_num_rows(num_rows);
+    return Status::OK();
+}
+
 // static void construct_tablet_index(TabletIndexPB* tablet_index, int64_t index_id,
 //                                    const std::string& index_name, int32_t col_unique_id) {
 //     tablet_index->set_index_id(index_id);
@@ -207,6 +246,17 @@ void check_sparse_column_meta(const ColumnMetaPB& column_meta, auto& path_with_s
     auto base_path = path->copy_pop_front().get_path();
     EXPECT_TRUE(base_path == "__DORIS_VARIANT_SPARSE__" ||
                 base_path.rfind("__DORIS_VARIANT_SPARSE__.b", 0) == 0);
+}
+
+static bool is_sparse_column_meta(const ColumnMetaPB& column_meta) {
+    if (!column_meta.has_column_path_info()) {
+        return false;
+    }
+    auto path = std::make_shared<vectorized::PathInData>();
+    path->from_protobuf(column_meta.column_path_info());
+    auto base_path = path->copy_pop_front().get_path();
+    return base_path == "__DORIS_VARIANT_SPARSE__" ||
+           base_path.rfind("__DORIS_VARIANT_SPARSE__.b", 0) == 0;
 }
 
 static void fill_variant_column_with_doc_value_only(
@@ -848,6 +898,259 @@ TEST_F(VariantColumnWriterReaderTest, test_write_data_normal) {
                                              &column_reader_cache);
     EXPECT_TRUE(st.ok()) << st.msg();
     EXPECT_TRUE(assert_cast<DefaultValueColumnIterator*>(it7.get()) != nullptr);
+    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
+}
+
+TEST_F(VariantColumnWriterReaderTest, test_variant_cast_storage_layout) {
+    constexpr int kNumRows = 1000;
+    constexpr int kMaxSubcolumns = 3;
+    constexpr int kSparseShardCount = 1;
+
+    // 1. create tablet_schema
+    TabletSchemaPB schema_pb;
+    schema_pb.set_keys_type(KeysType::DUP_KEYS);
+    construct_column(schema_pb.add_column(), 1, "VARIANT", "V1", kMaxSubcolumns, false, false,
+                     kSparseShardCount);
+    _tablet_schema = std::make_shared<TabletSchema>();
+    _tablet_schema->init_from_pb(schema_pb);
+
+    // 2. create tablet
+    TabletMetaSharedPtr tablet_meta(new TabletMeta(_tablet_schema));
+    _tablet_schema->set_external_segment_meta_used_default(false);
+    tablet_meta->_tablet_id = 10002;
+    _tablet = std::make_shared<Tablet>(*_engine_ref, tablet_meta, _data_dir.get());
+    EXPECT_TRUE(_tablet->init().ok());
+    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
+    EXPECT_TRUE(io::global_local_filesystem()->create_directory(_tablet->tablet_path()).ok());
+
+    auto write_segment = [&](int seg_id, vectorized::Block& block,
+                             SegmentFooterPB* footer) -> Status {
+        io::FileWriterPtr file_writer;
+        auto file_path = local_segment_path(_tablet->tablet_path(), "0", seg_id);
+        RETURN_IF_ERROR(
+                io::global_local_filesystem()->create_file(file_path, &file_writer));
+
+        ColumnWriterOptions opts;
+        opts.meta = footer->add_columns();
+        opts.compression_type = CompressionTypePB::LZ4;
+        opts.file_writer = file_writer.get();
+        opts.footer = footer;
+        RowsetWriterContext rowset_ctx;
+        rowset_ctx.write_type = DataWriteType::TYPE_DIRECT;
+        opts.rowset_ctx = &rowset_ctx;
+        opts.rowset_ctx->tablet_schema = _tablet_schema;
+        TabletColumn column = _tablet_schema->column(0);
+        _init_column_meta(opts.meta, 0, column, CompressionTypePB::LZ4);
+
+        std::unique_ptr<ColumnWriter> writer;
+        RETURN_IF_ERROR(ColumnWriter::create(opts, &column, file_writer.get(), &writer));
+        RETURN_IF_ERROR(writer->init());
+
+        auto olap_data_convertor = std::make_unique<vectorized::OlapBlockDataConvertor>();
+        olap_data_convertor->add_column_data_convertor(column);
+        size_t num_rows = block.get_by_position(0).column->size();
+        olap_data_convertor->set_source_content(&block, 0, num_rows);
+        auto [result, accessor] = olap_data_convertor->convert_column_data(0);
+        RETURN_IF_ERROR(result);
+        RETURN_IF_ERROR(writer->append(accessor->get_nullmap(), accessor->get_data(), num_rows));
+        RETURN_IF_ERROR(writer->finish());
+        RETURN_IF_ERROR(writer->write_data());
+        RETURN_IF_ERROR(writer->write_ordinal_index());
+        RETURN_IF_ERROR(writer->write_zone_map());
+        RETURN_IF_ERROR(file_writer->close());
+        footer->set_num_rows(num_rows);
+        return Status::OK();
+    };
+
+    // 3. direct variant: parse json to variant
+    std::unordered_map<int, std::string> inserted_jsonstr;
+    auto direct_block = _tablet_schema->create_block();
+    auto direct_variant = direct_block.get_by_position(0).column->assume_mutable();
+    VariantUtil::fill_object_column_with_test_data(direct_variant, kNumRows, &inserted_jsonstr);
+    SegmentFooterPB direct_footer;
+    auto st = write_segment(0, direct_block, &direct_footer);
+    EXPECT_TRUE(st.ok()) << st.to_json();
+
+    // 4. via string: wrap raw json strings as scalar root
+    auto via_block = _tablet_schema->create_block();
+    auto via_variant = via_block.get_by_position(0).column->assume_mutable();
+    auto* via_variant_col = assert_cast<vectorized::ColumnVariant*>(via_variant.get());
+    for (int i = 0; i < kNumRows; ++i) {
+        auto it = inserted_jsonstr.find(i);
+        ASSERT_TRUE(it != inserted_jsonstr.end());
+        const auto& json = it->second;
+        VariantUtil::insert_root_scalar_field(
+                *via_variant_col, vectorized::Field::create_field<TYPE_STRING>(
+                                          String(json.data(), json.size())));
+    }
+    SegmentFooterPB via_footer;
+    st = write_segment(1, via_block, &via_footer);
+    EXPECT_TRUE(st.ok()) << st.to_json();
+
+    int expected_sparse_cols = kSparseShardCount > 1 ? kSparseShardCount : 1;
+
+    // 5. via string: only root + sparse columns (no extracted subcolumns)
+    EXPECT_EQ(via_footer.columns_size(), 1 + expected_sparse_cols);
+    for (int i = 1; i < via_footer.columns_size(); ++i) {
+        EXPECT_TRUE(is_sparse_column_meta(via_footer.columns(i)));
+    }
+
+    // 6. direct: root + subcolumns + sparse
+    EXPECT_EQ(direct_footer.columns_size(), 1 + kMaxSubcolumns + expected_sparse_cols);
+    bool has_key0 = false;
+    bool has_sparse = false;
+    for (int i = 1; i < direct_footer.columns_size(); ++i) {
+        const auto& meta = direct_footer.columns(i);
+        if (!meta.has_column_path_info()) {
+            continue;
+        }
+        vectorized::PathInData path;
+        path.from_protobuf(meta.column_path_info());
+        auto rel_path = path.copy_pop_front().get_path();
+        if (rel_path == "key0") {
+            has_key0 = true;
+        }
+        if (is_sparse_column_meta(meta)) {
+            has_sparse = true;
+        }
+    }
+    EXPECT_TRUE(has_key0);
+    EXPECT_TRUE(has_sparse);
+}
+
+TEST_F(VariantColumnWriterReaderTest, test_variant_cast_storage_layout_via_string_json) {
+    constexpr int kNumRows = 100;
+    constexpr int kSrcMaxSubcolumns = 1;
+    constexpr int kDstMaxSubcolumns = 3;
+    constexpr int kSparseShardCount = 1;
+
+    TabletSchemaPB schema_pb;
+    schema_pb.set_keys_type(KeysType::DUP_KEYS);
+    construct_column(schema_pb.add_column(), 1, "VARIANT", "V1", kDstMaxSubcolumns, false, false,
+                     kSparseShardCount);
+    _tablet_schema = std::make_shared<TabletSchema>();
+    _tablet_schema->init_from_pb(schema_pb);
+
+    TabletMetaSharedPtr tablet_meta(new TabletMeta(_tablet_schema));
+    _tablet_schema->set_external_segment_meta_used_default(false);
+    tablet_meta->_tablet_id = 10003;
+    _tablet = std::make_shared<Tablet>(*_engine_ref, tablet_meta, _data_dir.get());
+    EXPECT_TRUE(_tablet->init().ok());
+    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
+    EXPECT_TRUE(io::global_local_filesystem()->create_directory(_tablet->tablet_path()).ok());
+
+    std::unordered_map<int, std::string> inserted_jsonstr;
+    auto t1_variant = ColumnVariant::create(kSrcMaxSubcolumns);
+    auto* t1_variant_col = assert_cast<vectorized::ColumnVariant*>(t1_variant.get());
+    t1_variant_col->set_variant_enable_typed_paths_to_sparse(false);
+    VariantUtil::fill_object_column_with_test_data(t1_variant, kNumRows, &inserted_jsonstr);
+
+    auto json_strings = ColumnString::create();
+    DataTypeSerDe::FormatOptions options;
+    for (int i = 0; i < kNumRows; ++i) {
+        std::string json;
+        t1_variant_col->serialize_one_row_to_string(i, &json, options);
+        json_strings->insert_data(json.data(), json.size());
+    }
+
+    auto via_variant = ColumnVariant::create(kDstMaxSubcolumns);
+    auto* via_variant_col = assert_cast<vectorized::ColumnVariant*>(via_variant.get());
+    via_variant_col->set_variant_enable_typed_paths_to_sparse(false);
+    vectorized::ParseConfig parse_config;
+    parse_config.enable_flatten_nested = false;
+    variant_util::parse_json_to_variant(*via_variant_col, *json_strings, parse_config);
+
+    auto via_block = _tablet_schema->create_block();
+    via_block.get_by_position(0).column = via_variant->get_ptr();
+
+    SegmentFooterPB via_footer;
+    auto st = write_variant_segment(_tablet_schema, _tablet, 0, via_block, &via_footer);
+    EXPECT_TRUE(st.ok()) << st.to_json();
+
+    int expected_sparse_cols = kSparseShardCount > 1 ? kSparseShardCount : 1;
+    EXPECT_EQ(via_footer.columns_size(), 1 + kDstMaxSubcolumns + expected_sparse_cols);
+    bool has_key0 = false;
+    bool has_sparse = false;
+    for (int i = 1; i < via_footer.columns_size(); ++i) {
+        const auto& meta = via_footer.columns(i);
+        if (!meta.has_column_path_info()) {
+            continue;
+        }
+        vectorized::PathInData path;
+        path.from_protobuf(meta.column_path_info());
+        auto rel_path = path.copy_pop_front().get_path();
+        if (rel_path == "key0") {
+            has_key0 = true;
+        }
+        if (is_sparse_column_meta(meta)) {
+            has_sparse = true;
+        }
+    }
+    EXPECT_TRUE(has_key0);
+    EXPECT_TRUE(has_sparse);
+    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
+}
+
+TEST_F(VariantColumnWriterReaderTest, test_variant_cast_storage_layout_direct_cast) {
+    constexpr int kNumRows = 100;
+    constexpr int kSrcMaxSubcolumns = 1;
+    constexpr int kDstMaxSubcolumns = 3;
+    constexpr int kSparseShardCount = 1;
+
+    TabletSchemaPB schema_pb;
+    schema_pb.set_keys_type(KeysType::DUP_KEYS);
+    construct_column(schema_pb.add_column(), 1, "VARIANT", "V1", kDstMaxSubcolumns, false, false,
+                     kSparseShardCount);
+    _tablet_schema = std::make_shared<TabletSchema>();
+    _tablet_schema->init_from_pb(schema_pb);
+
+    TabletMetaSharedPtr tablet_meta(new TabletMeta(_tablet_schema));
+    _tablet_schema->set_external_segment_meta_used_default(false);
+    tablet_meta->_tablet_id = 10004;
+    _tablet = std::make_shared<Tablet>(*_engine_ref, tablet_meta, _data_dir.get());
+    EXPECT_TRUE(_tablet->init().ok());
+    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
+    EXPECT_TRUE(io::global_local_filesystem()->create_directory(_tablet->tablet_path()).ok());
+
+    std::unordered_map<int, std::string> inserted_jsonstr;
+    auto t1_variant = ColumnVariant::create(kSrcMaxSubcolumns);
+    auto* t1_variant_col = assert_cast<vectorized::ColumnVariant*>(t1_variant.get());
+    t1_variant_col->set_variant_enable_typed_paths_to_sparse(false);
+    VariantUtil::fill_object_column_with_test_data(t1_variant, kNumRows, &inserted_jsonstr);
+
+    auto direct_variant = t1_variant->clone();
+    auto* direct_variant_col = assert_cast<vectorized::ColumnVariant*>(direct_variant.get());
+    direct_variant_col->set_variant_enable_typed_paths_to_sparse(false);
+    EXPECT_TRUE(direct_variant_col->adjust_max_subcolumns_count(kDstMaxSubcolumns).ok());
+
+    auto direct_block = _tablet_schema->create_block();
+    direct_block.get_by_position(0).column = direct_variant->get_ptr();
+
+    SegmentFooterPB direct_footer;
+    auto st = write_variant_segment(_tablet_schema, _tablet, 0, direct_block, &direct_footer);
+    EXPECT_TRUE(st.ok()) << st.to_json();
+
+    int expected_sparse_cols = kSparseShardCount > 1 ? kSparseShardCount : 1;
+    EXPECT_EQ(direct_footer.columns_size(), 1 + kDstMaxSubcolumns + expected_sparse_cols);
+    bool has_key0 = false;
+    bool has_sparse = false;
+    for (int i = 1; i < direct_footer.columns_size(); ++i) {
+        const auto& meta = direct_footer.columns(i);
+        if (!meta.has_column_path_info()) {
+            continue;
+        }
+        vectorized::PathInData path;
+        path.from_protobuf(meta.column_path_info());
+        auto rel_path = path.copy_pop_front().get_path();
+        if (rel_path == "key0") {
+            has_key0 = true;
+        }
+        if (is_sparse_column_meta(meta)) {
+            has_sparse = true;
+        }
+    }
+    EXPECT_TRUE(has_key0);
+    EXPECT_TRUE(has_sparse);
     EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
 }
 

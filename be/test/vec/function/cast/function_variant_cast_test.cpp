@@ -25,6 +25,7 @@
 #include "runtime/runtime_state.h"
 #include "vec/columns/column_array.h"
 #include "vec/columns/column_variant.h"
+#include "vec/common/variant_util.h"
 #include "vec/core/field.h"
 #include "vec/data_types/data_type_array.h"
 #include "vec/data_types/data_type_nullable.h"
@@ -463,6 +464,253 @@ TEST(FunctionVariantCast, CastFromVariantWithEmptyRoot) {
         ASSERT_EQ(nullable_result->size(), 1);
         ASSERT_TRUE(nullable_result->is_null_at(1));
     }
+}
+
+// Build a variant column with many subcolumns to stress cast paths.
+static MutableColumnPtr build_dense_variant_column(size_t num_rows, size_t num_subcols,
+                                                   int32_t max_subcolumns_count) {
+    auto variant_col = ColumnVariant::create(max_subcolumns_count);
+    // Spread subcolumns across nested paths to mimic complex JSON/Variant documents.
+    size_t outer = std::max<size_t>(1, static_cast<size_t>(std::sqrt(num_subcols)));
+    size_t inner = (num_subcols + outer - 1) / outer;
+    for (size_t row = 0; row < num_rows; ++row) {
+        VariantMap object;
+        for (size_t c = 0; c < num_subcols; ++c) {
+            size_t outer_id = c / inner;
+            size_t inner_id = c % inner;
+            std::string path =
+                    "obj" + std::to_string(outer_id) + ".field" + std::to_string(inner_id);
+            // keep values unique but deterministic
+            FieldWithDataType value;
+            value.field = Field::create_field<TYPE_BIGINT>(static_cast<int64_t>(row * 1000 + c));
+            value.base_scalar_type_id = PrimitiveType::TYPE_BIGINT;
+            value.num_dimensions = 0;
+            object.try_emplace(PathInData(path), std::move(value));
+        }
+        variant_col->try_insert(Field::create_field<TYPE_VARIANT>(std::move(object)));
+    }
+    variant_col->finalize();
+    return variant_col;
+}
+
+static ColumnPtr execute_cast(ColumnPtr column, const DataTypePtr& from_type,
+                              const DataTypePtr& to_type, FunctionContext* ctx, size_t num_rows) {
+    ColumnsWithTypeAndName arguments {{std::move(column), from_type, "src"},
+                                      {nullptr, to_type, "dst"}};
+    auto function = SimpleFunctionFactory::instance().get_function("CAST", arguments, to_type);
+    EXPECT_NE(function, nullptr);
+    Block block {arguments};
+    size_t result_pos = block.columns();
+    block.insert({nullptr, to_type, "result"});
+    EXPECT_TRUE(function->execute(ctx, block, {0}, result_pos, num_rows).ok());
+    return block.get_by_position(result_pos).column;
+}
+
+static ColumnPtr parse_json_strings_to_variant(const ColumnString& json_strings,
+                                               const DataTypePtr& variant_type,
+                                               bool enforce_max_subcolumns) {
+    const auto& variant_data_type = assert_cast<const DataTypeVariant&>(*variant_type);
+    auto variant_col = ColumnVariant::create(variant_data_type.variant_max_subcolumns_count());
+    auto* variant = assert_cast<ColumnVariant*>(variant_col.get());
+    variant->set_variant_enable_typed_paths_to_sparse(
+            variant_data_type.variant_enable_typed_paths_to_sparse());
+    ParseConfig parse_config;
+    variant_util::parse_json_to_variant(*variant, json_strings, parse_config);
+    if (enforce_max_subcolumns) {
+        EXPECT_TRUE(variant
+                            ->adjust_max_subcolumns_count(
+                                    variant_data_type.variant_max_subcolumns_count())
+                            .ok());
+    }
+    return ColumnPtr(std::move(variant_col));
+}
+
+// variant -> string -> variant when only variant_max_subcolumns_count differs
+TEST(FunctionVariantCast, VariantCastViaStringDifferentMaxSubcolumns) {
+    const size_t num_rows = 100;
+    const size_t num_subcols = 10000;
+    auto src_variant_type = std::make_shared<DataTypeVariant>(10000);
+    auto dst_variant_type = std::make_shared<DataTypeVariant>(8000);
+    auto string_type = std::make_shared<DataTypeString>();
+    auto src_col = build_dense_variant_column(num_rows, num_subcols, 10000);
+
+    RuntimeState state;
+    auto ctx = FunctionContext::create_context(&state, {}, {});
+
+    // variant -> string -> parse JSON to variant (simulate JSON load path)
+    auto string_col =
+            execute_cast(src_col->get_ptr(), src_variant_type, string_type, ctx.get(), num_rows);
+    const auto& json_strings =
+            assert_cast<const ColumnString&>(*remove_nullable(string_col));
+    auto json_variant = ColumnVariant::create(dst_variant_type->variant_max_subcolumns_count());
+    auto* json_variant_col = assert_cast<ColumnVariant*>(json_variant.get());
+    json_variant_col->set_variant_enable_typed_paths_to_sparse(
+            dst_variant_type->variant_enable_typed_paths_to_sparse());
+    ParseConfig parse_config;
+    variant_util::parse_json_to_variant(*json_variant_col, json_strings, parse_config);
+    ColumnPtr via_string_variant = std::move(json_variant);
+    ASSERT_EQ(via_string_variant->size(), num_rows);
+
+    // Validate by casting to string and comparing with the original string output
+    auto via_string_to_str = assert_cast<const ColumnString&>(
+            *remove_nullable(execute_cast(via_string_variant, dst_variant_type, string_type,
+                                          ctx.get(), num_rows)));
+    auto orig_to_str =
+            assert_cast<const ColumnString&>(*remove_nullable(string_col));
+
+    ASSERT_EQ(via_string_to_str.size(), orig_to_str.size());
+    for (size_t i = 0; i < num_rows; ++i) {
+        ASSERT_EQ(via_string_to_str.get_data_at(i).to_string(),
+                  orig_to_str.get_data_at(i).to_string());
+    }
+
+    const auto& via_string_variant_col =
+            assert_cast<const ColumnVariant&>(*via_string_variant);
+    ASSERT_FALSE(via_string_variant_col.is_scalar_variant());
+    ASSERT_TRUE(via_string_variant_col.has_subcolumn(PathInData("obj0.field0")));
+}
+
+// Direct variant -> variant when only variant_max_subcolumns_count differs
+TEST(FunctionVariantCast, VariantCastDirectDifferentMaxSubcolumns) {
+    const size_t num_rows = 100;
+    const size_t num_subcols = 10000;
+    auto src_variant_type = std::make_shared<DataTypeVariant>(10000);
+    auto dst_variant_type = std::make_shared<DataTypeVariant>(8000);
+    auto string_type = std::make_shared<DataTypeString>();
+    auto src_col = build_dense_variant_column(num_rows, num_subcols, 10000);
+
+    RuntimeState state;
+    auto ctx = FunctionContext::create_context(&state, {}, {});
+
+    auto orig_to_str = assert_cast<const ColumnString&>(
+            *remove_nullable(execute_cast(src_col->get_ptr(), src_variant_type, string_type,
+                                          ctx.get(), num_rows)));
+
+    auto direct_variant = remove_nullable(
+            execute_cast(std::move(src_col), src_variant_type, dst_variant_type, ctx.get(),
+                         num_rows));
+    ASSERT_EQ(direct_variant->size(), num_rows);
+
+    // Validate by comparing string serialization with original
+    auto direct_to_str = assert_cast<const ColumnString&>(
+            *remove_nullable(execute_cast(direct_variant, dst_variant_type, string_type,
+                                          ctx.get(), num_rows)));
+    ASSERT_EQ(direct_to_str.size(), orig_to_str.size());
+    for (size_t i = 0; i < num_rows; ++i) {
+        ASSERT_EQ(direct_to_str.get_data_at(i).to_string(),
+                  orig_to_str.get_data_at(i).to_string());
+    }
+
+    const auto& direct_variant_col = assert_cast<const ColumnVariant&>(*direct_variant);
+    ASSERT_FALSE(direct_variant_col.is_scalar_variant());
+    ASSERT_TRUE(direct_variant_col.has_subcolumn(PathInData("obj0.field0")));
+}
+
+TEST(FunctionVariantCast, VariantCastViaStringSqlLikeDifferentMaxSubcolumns) {
+    const size_t num_rows = 100;
+    const size_t num_subcols = 10000;
+    auto src_variant_type = std::make_shared<DataTypeVariant>(10000, false);
+    auto dst_variant_type = std::make_shared<DataTypeVariant>(8000, false);
+    auto string_type = std::make_shared<DataTypeString>();
+    auto seed_variant = build_dense_variant_column(num_rows, num_subcols, 10000);
+
+    RuntimeState state;
+    auto ctx = FunctionContext::create_context(&state, {}, {});
+
+    auto seed_string_col = execute_cast(seed_variant->get_ptr(), src_variant_type, string_type,
+                                        ctx.get(), num_rows);
+    const auto& seed_json_strings =
+            assert_cast<const ColumnString&>(*remove_nullable(seed_string_col));
+    auto t1_variant = parse_json_strings_to_variant(seed_json_strings, src_variant_type, false);
+
+    auto k_col = ColumnInt32::create();
+    for (size_t i = 0; i < num_rows; ++i) {
+        k_col->insert(Field::create_field<TYPE_INT>(static_cast<int32_t>(i + 1)));
+    }
+    auto k_type = std::make_shared<DataTypeInt32>();
+    Block src_block;
+    src_block.insert({k_col->get_ptr(), k_type, "k"});
+    src_block.insert({t1_variant, src_variant_type, "v"});
+
+    auto string_col = execute_cast(src_block.get_by_position(1).column, src_variant_type,
+                                   string_type, ctx.get(), num_rows);
+    const auto& json_strings =
+            assert_cast<const ColumnString&>(*remove_nullable(string_col));
+    auto dst_variant = parse_json_strings_to_variant(json_strings, dst_variant_type, false);
+
+    Block dst_block;
+    dst_block.insert({src_block.get_by_position(0).column, src_block.get_by_position(0).type,
+                      "k"});
+    dst_block.insert({dst_variant, dst_variant_type, "v"});
+
+    auto via_to_str = assert_cast<const ColumnString&>(
+            *remove_nullable(execute_cast(dst_block.get_by_position(1).column, dst_variant_type,
+                                          string_type, ctx.get(), num_rows)));
+    auto orig_to_str =
+            assert_cast<const ColumnString&>(*remove_nullable(string_col));
+    ASSERT_EQ(via_to_str.size(), orig_to_str.size());
+    for (size_t i = 0; i < num_rows; ++i) {
+        ASSERT_EQ(via_to_str.get_data_at(i).to_string(),
+                  orig_to_str.get_data_at(i).to_string());
+    }
+
+    const auto& via_variant_col = assert_cast<const ColumnVariant&>(
+            *dst_block.get_by_position(1).column);
+    ASSERT_FALSE(via_variant_col.is_scalar_variant());
+    ASSERT_TRUE(via_variant_col.has_subcolumn(PathInData("obj0.field0")));
+}
+
+TEST(FunctionVariantCast, VariantCastDirectSqlLikeDifferentMaxSubcolumns) {
+    const size_t num_rows = 100;
+    const size_t num_subcols = 10000;
+    auto src_variant_type = std::make_shared<DataTypeVariant>(10000, false);
+    auto dst_variant_type = std::make_shared<DataTypeVariant>(8000, false);
+    auto string_type = std::make_shared<DataTypeString>();
+    auto seed_variant = build_dense_variant_column(num_rows, num_subcols, 10000);
+
+    RuntimeState state;
+    auto ctx = FunctionContext::create_context(&state, {}, {});
+
+    auto seed_string_col = execute_cast(seed_variant->get_ptr(), src_variant_type, string_type,
+                                        ctx.get(), num_rows);
+    const auto& seed_json_strings =
+            assert_cast<const ColumnString&>(*remove_nullable(seed_string_col));
+    auto t1_variant = parse_json_strings_to_variant(seed_json_strings, src_variant_type, true);
+
+    auto k_col = ColumnInt32::create();
+    for (size_t i = 0; i < num_rows; ++i) {
+        k_col->insert(Field::create_field<TYPE_INT>(static_cast<int32_t>(i + 1)));
+    }
+    auto k_type = std::make_shared<DataTypeInt32>();
+    Block src_block;
+    src_block.insert({k_col->get_ptr(), k_type, "k"});
+    src_block.insert({t1_variant, src_variant_type, "v"});
+
+    auto orig_to_str = assert_cast<const ColumnString&>(
+            *remove_nullable(execute_cast(src_block.get_by_position(1).column, src_variant_type,
+                                          string_type, ctx.get(), num_rows)));
+    auto direct_variant = remove_nullable(
+            execute_cast(src_block.get_by_position(1).column, src_variant_type, dst_variant_type,
+                         ctx.get(), num_rows));
+
+    Block dst_block;
+    dst_block.insert({src_block.get_by_position(0).column, src_block.get_by_position(0).type,
+                      "k"});
+    dst_block.insert({direct_variant, dst_variant_type, "v"});
+
+    auto direct_to_str = assert_cast<const ColumnString&>(
+            *remove_nullable(execute_cast(dst_block.get_by_position(1).column, dst_variant_type,
+                                          string_type, ctx.get(), num_rows)));
+    ASSERT_EQ(direct_to_str.size(), orig_to_str.size());
+    for (size_t i = 0; i < num_rows; ++i) {
+        ASSERT_EQ(direct_to_str.get_data_at(i).to_string(),
+                  orig_to_str.get_data_at(i).to_string());
+    }
+
+    const auto& direct_variant_col = assert_cast<const ColumnVariant&>(
+            *dst_block.get_by_position(1).column);
+    ASSERT_FALSE(direct_variant_col.is_scalar_variant());
+    ASSERT_TRUE(direct_variant_col.has_subcolumn(PathInData("obj0.field0")));
 }
 
 } // namespace doris::vectorized
