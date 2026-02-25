@@ -506,6 +506,19 @@ static ColumnPtr execute_cast(ColumnPtr column, const DataTypePtr& from_type,
     return block.get_by_position(result_pos).column;
 }
 
+class FunctionVariantCastPerformanceTest : public ::testing::Test {
+protected:
+    static constexpr size_t kNumRows = 1000;
+    static constexpr size_t kNumSubcols = 10000;
+    static MutableColumnPtr src_col;
+
+    static void SetUpTestSuite() { src_col = build_dense_variant_column(kNumRows, kNumSubcols, 1000); }
+
+    static void TearDownTestSuite() { src_col.reset(); }
+};
+
+MutableColumnPtr FunctionVariantCastPerformanceTest::src_col;
+
 // static ColumnPtr parse_json_strings_to_variant(const ColumnString& json_strings,
 //                                                const DataTypePtr& variant_type,
 //                                                bool enforce_max_subcolumns) {
@@ -526,20 +539,18 @@ static ColumnPtr execute_cast(ColumnPtr column, const DataTypePtr& from_type,
 // }
 
 // variant -> string -> variant when only variant_max_subcolumns_count differs
-TEST(FunctionVariantCast, VariantCastViaStringDifferentMaxSubcolumns) {
-    const size_t num_rows = 1000;
-    const size_t num_subcols = 10000;
+TEST_F(FunctionVariantCastPerformanceTest, VariantCastViaStringDifferentMaxSubcolumns) {
     auto src_variant_type = std::make_shared<DataTypeVariant>(1000);
     auto dst_variant_type = std::make_shared<DataTypeVariant>(2000);
     auto string_type = std::make_shared<DataTypeString>();
-    auto src_col = build_dense_variant_column(num_rows, num_subcols, 1000);
+    ASSERT_NE(src_col.get(), nullptr);
 
     RuntimeState state;
     auto ctx = FunctionContext::create_context(&state, {}, {});
 
     // variant -> string -> parse JSON to variant (simulate JSON load path)
     auto string_col =
-            execute_cast(src_col->get_ptr(), src_variant_type, string_type, ctx.get(), num_rows);
+            execute_cast(src_col->get_ptr(), src_variant_type, string_type, ctx.get(), kNumRows);
     const auto& json_strings =
             assert_cast<const ColumnString&>(*remove_nullable(string_col));
     auto json_variant = ColumnVariant::create(dst_variant_type->variant_max_subcolumns_count());
@@ -549,7 +560,7 @@ TEST(FunctionVariantCast, VariantCastViaStringDifferentMaxSubcolumns) {
     ParseConfig parse_config;
     variant_util::parse_json_to_variant(*json_variant_col, json_strings, parse_config);
     ColumnPtr via_string_variant = std::move(json_variant);
-    ASSERT_EQ(via_string_variant->size(), num_rows);
+    ASSERT_EQ(via_string_variant->size(), kNumRows);
 
     // 验证正确性逻辑暂时注释掉（性能对比用）
     // auto via_string_to_str = assert_cast<const ColumnString&>(
@@ -571,25 +582,23 @@ TEST(FunctionVariantCast, VariantCastViaStringDifferentMaxSubcolumns) {
 }
 
 // Direct variant -> variant when only variant_max_subcolumns_count differs
-TEST(FunctionVariantCast, VariantCastDirectDifferentMaxSubcolumns) {
-    const size_t num_rows = 1000;
-    const size_t num_subcols = 10000;
+TEST_F(FunctionVariantCastPerformanceTest, VariantCastDirectDifferentMaxSubcolumns) {
     auto src_variant_type = std::make_shared<DataTypeVariant>(1000);
     auto dst_variant_type = std::make_shared<DataTypeVariant>(2000);
     auto string_type = std::make_shared<DataTypeString>();
-    auto src_col = build_dense_variant_column(num_rows, num_subcols, 1000);
+    ASSERT_NE(src_col.get(), nullptr);
 
     RuntimeState state;
     auto ctx = FunctionContext::create_context(&state, {}, {});
 
     auto orig_to_str = assert_cast<const ColumnString&>(
             *remove_nullable(execute_cast(src_col->get_ptr(), src_variant_type, string_type,
-                                          ctx.get(), num_rows)));
+                                          ctx.get(), kNumRows)));
 
     auto direct_variant = remove_nullable(
-            execute_cast(std::move(src_col), src_variant_type, dst_variant_type, ctx.get(),
-                         num_rows));
-    ASSERT_EQ(direct_variant->size(), num_rows);
+            execute_cast(src_col->get_ptr(), src_variant_type, dst_variant_type, ctx.get(),
+                         kNumRows));
+    ASSERT_EQ(direct_variant->size(), kNumRows);
 
     // 验证正确性逻辑暂时注释掉（性能对比用）
     // auto direct_to_str = assert_cast<const ColumnString&>(

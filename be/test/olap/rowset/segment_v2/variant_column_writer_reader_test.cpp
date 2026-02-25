@@ -16,6 +16,8 @@
 // under the License.
 
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <thread>
 
 #include "gtest/gtest.h"
@@ -258,6 +260,79 @@ static bool is_sparse_column_meta(const ColumnMetaPB& column_meta) {
     return base_path == "__DORIS_VARIANT_SPARSE__" ||
            base_path.rfind("__DORIS_VARIANT_SPARSE__.b", 0) == 0;
 }
+
+// Keep test data shape consistent with FunctionVariantCastPerformanceTest.
+static MutableColumnPtr build_dense_variant_column_for_cast_perf(size_t num_rows, size_t num_subcols,
+                                                                 int32_t max_subcolumns_count) {
+    auto variant_col = ColumnVariant::create(max_subcolumns_count);
+    size_t outer = std::max<size_t>(1, static_cast<size_t>(std::sqrt(num_subcols)));
+    size_t inner = (num_subcols + outer - 1) / outer;
+    for (size_t row = 0; row < num_rows; ++row) {
+        VariantMap object;
+        for (size_t c = 0; c < num_subcols; ++c) {
+            size_t outer_id = c / inner;
+            size_t inner_id = c % inner;
+            std::string path =
+                    "obj" + std::to_string(outer_id) + ".field" + std::to_string(inner_id);
+            FieldWithDataType value;
+            value.field =
+                    vectorized::Field::create_field<TYPE_BIGINT>(static_cast<int64_t>(row * 1000 + c));
+            value.base_scalar_type_id = PrimitiveType::TYPE_BIGINT;
+            value.num_dimensions = 0;
+            object.try_emplace(PathInData(path), std::move(value));
+        }
+        variant_col->try_insert(vectorized::Field::create_field<TYPE_VARIANT>(std::move(object)));
+    }
+    variant_col->finalize();
+    auto st = variant_col->adjust_max_subcolumns_count(max_subcolumns_count);
+    CHECK(st.ok()) << st.to_string();
+    return variant_col;
+}
+
+class VariantCastStorageLayoutPerfTest : public testing::Test {
+protected:
+    static constexpr int kNumRows = 1000;
+    static constexpr int kNumSubcols = 10000;
+    static constexpr int kSrcMaxSubcolumns = 1000;
+    static constexpr int kDstMaxSubcolumns = 10000;
+    static constexpr int kRounds = 5;
+    static MutableColumnPtr src_variant;
+
+    static void SetUpTestSuite() {
+        src_variant =
+                build_dense_variant_column_for_cast_perf(kNumRows, kNumSubcols, kSrcMaxSubcolumns);
+    }
+
+    static void TearDownTestSuite() { src_variant.reset(); }
+
+    static MutableColumnPtr cast_via_string_json_once() {
+        auto* src_variant_col = assert_cast<vectorized::ColumnVariant*>(src_variant.get());
+        auto json_strings = ColumnString::create();
+        DataTypeSerDe::FormatOptions options;
+        for (int i = 0; i < kNumRows; ++i) {
+            std::string json;
+            src_variant_col->serialize_one_row_to_string(i, &json, options);
+            json_strings->insert_data(json.data(), json.size());
+        }
+
+        auto via_variant = ColumnVariant::create(kDstMaxSubcolumns);
+        auto* via_variant_col = assert_cast<vectorized::ColumnVariant*>(via_variant.get());
+        vectorized::ParseConfig parse_config;
+        parse_config.enable_flatten_nested = false;
+        variant_util::parse_json_to_variant(*via_variant_col, *json_strings, parse_config);
+        return via_variant;
+    }
+
+    static Status cast_direct_once(MutableColumnPtr* out) {
+        auto direct_variant = src_variant->clone();
+        auto* direct_variant_col = assert_cast<vectorized::ColumnVariant*>(direct_variant.get());
+        RETURN_IF_ERROR(direct_variant_col->adjust_max_subcolumns_count(kDstMaxSubcolumns));
+        *out = std::move(direct_variant);
+        return Status::OK();
+    }
+};
+
+MutableColumnPtr VariantCastStorageLayoutPerfTest::src_variant;
 
 static void fill_variant_column_with_doc_value_only(
         vectorized::MutableColumnPtr& column_object, int num_rows,
@@ -1018,140 +1093,56 @@ TEST_F(VariantColumnWriterReaderTest, test_variant_cast_storage_layout) {
     EXPECT_TRUE(has_sparse);
 }
 
-TEST_F(VariantColumnWriterReaderTest, test_variant_cast_storage_layout_via_string_json) {
-    constexpr int kNumRows = 100;
-    constexpr int kSrcMaxSubcolumns = 1;
-    constexpr int kDstMaxSubcolumns = 3;
-    constexpr int kSparseShardCount = 1;
+TEST_F(VariantCastStorageLayoutPerfTest, test_variant_cast_storage_layout_via_string_json) {
+    ASSERT_NE(src_variant.get(), nullptr);
 
-    TabletSchemaPB schema_pb;
-    schema_pb.set_keys_type(KeysType::DUP_KEYS);
-    construct_column(schema_pb.add_column(), 1, "VARIANT", "V1", kDstMaxSubcolumns, false, false,
-                     kSparseShardCount);
-    _tablet_schema = std::make_shared<TabletSchema>();
-    _tablet_schema->init_from_pb(schema_pb);
+    // Warm up once to reduce one-off allocation noise.
+    static_cast<void>(cast_via_string_json_once());
 
-    TabletMetaSharedPtr tablet_meta(new TabletMeta(_tablet_schema));
-    _tablet_schema->set_external_segment_meta_used_default(false);
-    tablet_meta->_tablet_id = 10003;
-    _tablet = std::make_shared<Tablet>(*_engine_ref, tablet_meta, _data_dir.get());
-    EXPECT_TRUE(_tablet->init().ok());
-    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
-    EXPECT_TRUE(io::global_local_filesystem()->create_directory(_tablet->tablet_path()).ok());
-
-    std::unordered_map<int, std::string> inserted_jsonstr;
-    auto t1_variant = ColumnVariant::create(kSrcMaxSubcolumns);
-    auto* t1_variant_col = assert_cast<vectorized::ColumnVariant*>(t1_variant.get());
-    t1_variant_col->set_variant_enable_typed_paths_to_sparse(false);
-    VariantUtil::fill_object_column_with_test_data(t1_variant, kNumRows, &inserted_jsonstr);
-
-    auto json_strings = ColumnString::create();
-    DataTypeSerDe::FormatOptions options;
-    for (int i = 0; i < kNumRows; ++i) {
-        std::string json;
-        t1_variant_col->serialize_one_row_to_string(i, &json, options);
-        json_strings->insert_data(json.data(), json.size());
+    std::chrono::nanoseconds total_cast_ns(0);
+    MutableColumnPtr via_variant;
+    for (int i = 0; i < kRounds; ++i) {
+        auto begin = std::chrono::steady_clock::now();
+        via_variant = cast_via_string_json_once();
+        total_cast_ns += std::chrono::steady_clock::now() - begin;
     }
 
-    auto via_variant = ColumnVariant::create(kDstMaxSubcolumns);
-    auto* via_variant_col = assert_cast<vectorized::ColumnVariant*>(via_variant.get());
-    via_variant_col->set_variant_enable_typed_paths_to_sparse(false);
-    vectorized::ParseConfig parse_config;
-    parse_config.enable_flatten_nested = false;
-    variant_util::parse_json_to_variant(*via_variant_col, *json_strings, parse_config);
+    ASSERT_NE(via_variant.get(), nullptr);
+    ASSERT_EQ(via_variant->size(), kNumRows);
+    EXPECT_TRUE(assert_cast<const vectorized::ColumnVariant*>(via_variant.get())
+                        ->has_subcolumn(PathInData("obj0.field0")));
 
-    auto via_block = _tablet_schema->create_block();
-    via_block.get_by_position(0).column = via_variant->get_ptr();
-
-    SegmentFooterPB via_footer;
-    auto st = write_variant_segment(_tablet_schema, _tablet, 0, via_block, &via_footer);
-    EXPECT_TRUE(st.ok()) << st.to_json();
-
-    int expected_sparse_cols = kSparseShardCount > 1 ? kSparseShardCount : 1;
-    EXPECT_EQ(via_footer.columns_size(), 1 + kDstMaxSubcolumns + expected_sparse_cols);
-    bool has_key0 = false;
-    bool has_sparse = false;
-    for (int i = 1; i < via_footer.columns_size(); ++i) {
-        const auto& meta = via_footer.columns(i);
-        if (!meta.has_column_path_info()) {
-            continue;
-        }
-        vectorized::PathInData path;
-        path.from_protobuf(meta.column_path_info());
-        auto rel_path = path.copy_pop_front().get_path();
-        if (rel_path == "key0") {
-            has_key0 = true;
-        }
-        if (is_sparse_column_meta(meta)) {
-            has_sparse = true;
-        }
-    }
-    EXPECT_TRUE(has_key0);
-    EXPECT_TRUE(has_sparse);
-    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
+    auto avg_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(total_cast_ns).count() / kRounds;
+    std::cout << "[CAST PERF] via_string_json avg_cast_ms=" << avg_ms
+              << ", rounds=" << kRounds << ", rows=" << kNumRows << std::endl;
 }
 
-TEST_F(VariantColumnWriterReaderTest, test_variant_cast_storage_layout_direct_cast) {
-    constexpr int kNumRows = 100;
-    constexpr int kSrcMaxSubcolumns = 1;
-    constexpr int kDstMaxSubcolumns = 3;
-    constexpr int kSparseShardCount = 1;
+TEST_F(VariantCastStorageLayoutPerfTest, test_variant_cast_storage_layout_direct_cast) {
+    ASSERT_NE(src_variant.get(), nullptr);
 
-    TabletSchemaPB schema_pb;
-    schema_pb.set_keys_type(KeysType::DUP_KEYS);
-    construct_column(schema_pb.add_column(), 1, "VARIANT", "V1", kDstMaxSubcolumns, false, false,
-                     kSparseShardCount);
-    _tablet_schema = std::make_shared<TabletSchema>();
-    _tablet_schema->init_from_pb(schema_pb);
+    // Warm up once to reduce one-off allocation noise.
+    MutableColumnPtr warmup_variant;
+    ASSERT_TRUE(cast_direct_once(&warmup_variant).ok());
 
-    TabletMetaSharedPtr tablet_meta(new TabletMeta(_tablet_schema));
-    _tablet_schema->set_external_segment_meta_used_default(false);
-    tablet_meta->_tablet_id = 10004;
-    _tablet = std::make_shared<Tablet>(*_engine_ref, tablet_meta, _data_dir.get());
-    EXPECT_TRUE(_tablet->init().ok());
-    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
-    EXPECT_TRUE(io::global_local_filesystem()->create_directory(_tablet->tablet_path()).ok());
-
-    std::unordered_map<int, std::string> inserted_jsonstr;
-    auto t1_variant = ColumnVariant::create(kSrcMaxSubcolumns);
-    auto* t1_variant_col = assert_cast<vectorized::ColumnVariant*>(t1_variant.get());
-    t1_variant_col->set_variant_enable_typed_paths_to_sparse(false);
-    VariantUtil::fill_object_column_with_test_data(t1_variant, kNumRows, &inserted_jsonstr);
-
-    auto direct_variant = t1_variant->clone();
-    auto* direct_variant_col = assert_cast<vectorized::ColumnVariant*>(direct_variant.get());
-    direct_variant_col->set_variant_enable_typed_paths_to_sparse(false);
-    EXPECT_TRUE(direct_variant_col->adjust_max_subcolumns_count(kDstMaxSubcolumns).ok());
-
-    auto direct_block = _tablet_schema->create_block();
-    direct_block.get_by_position(0).column = direct_variant->get_ptr();
-
-    SegmentFooterPB direct_footer;
-    auto st = write_variant_segment(_tablet_schema, _tablet, 0, direct_block, &direct_footer);
-    EXPECT_TRUE(st.ok()) << st.to_json();
-
-    int expected_sparse_cols = kSparseShardCount > 1 ? kSparseShardCount : 1;
-    EXPECT_EQ(direct_footer.columns_size(), 1 + kDstMaxSubcolumns + expected_sparse_cols);
-    bool has_key0 = false;
-    bool has_sparse = false;
-    for (int i = 1; i < direct_footer.columns_size(); ++i) {
-        const auto& meta = direct_footer.columns(i);
-        if (!meta.has_column_path_info()) {
-            continue;
-        }
-        vectorized::PathInData path;
-        path.from_protobuf(meta.column_path_info());
-        auto rel_path = path.copy_pop_front().get_path();
-        if (rel_path == "key0") {
-            has_key0 = true;
-        }
-        if (is_sparse_column_meta(meta)) {
-            has_sparse = true;
-        }
+    std::chrono::nanoseconds total_cast_ns(0);
+    MutableColumnPtr direct_variant;
+    for (int i = 0; i < kRounds; ++i) {
+        auto begin = std::chrono::steady_clock::now();
+        auto st = cast_direct_once(&direct_variant);
+        ASSERT_TRUE(st.ok()) << st.to_string();
+        total_cast_ns += std::chrono::steady_clock::now() - begin;
     }
-    EXPECT_TRUE(has_key0);
-    EXPECT_TRUE(has_sparse);
-    EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_tablet->tablet_path()).ok());
+
+    ASSERT_NE(direct_variant.get(), nullptr);
+    ASSERT_EQ(direct_variant->size(), kNumRows);
+    EXPECT_TRUE(assert_cast<const vectorized::ColumnVariant*>(direct_variant.get())
+                        ->has_subcolumn(PathInData("obj0.field0")));
+
+    auto avg_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(total_cast_ns).count() / kRounds;
+    std::cout << "[CAST PERF] direct_cast avg_cast_ms=" << avg_ms << ", rounds=" << kRounds
+              << ", rows=" << kNumRows << std::endl;
 }
 
 TEST_F(VariantColumnWriterReaderTest, test_write_doc_and_read_hierarchical_doc) {
